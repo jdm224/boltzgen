@@ -907,18 +907,28 @@ class BinderDesignPipeline:
                 f"Invalid protocol: {protocol}. Valid protocols: {list(protocol_configs.keys())}"
             )
 
-        # Handle use_kernels argument
-        device_capability = torch.cuda.get_device_capability()
-        use_kernels = None
-        if args.use_kernels == "auto":
-            use_kernels = device_capability[0] >= 8
-        elif args.use_kernels == "true":
-            use_kernels = True
-        elif args.use_kernels == "false":
-            use_kernels = False
+        # Check if only CPU steps are requested (analysis, filtering)
+        cpu_only_steps = {"analysis", "filtering"}
+        requires_gpu = args.steps is None or not set(args.steps).issubset(cpu_only_steps)
+
+        # Handle use_kernels argument - only check CUDA if GPU is needed
+        if requires_gpu:
+            device_capability = torch.cuda.get_device_capability()
+            use_kernels = None
+            if args.use_kernels == "auto":
+                use_kernels = device_capability[0] >= 8
+            elif args.use_kernels == "true":
+                use_kernels = True
+            elif args.use_kernels == "false":
+                use_kernels = False
+            else:
+                raise ValueError(f"Invalid use_kernels value: {args.use_kernels}")
+            print(f"Using kernels: {use_kernels} [device capability: {device_capability}]")
         else:
-            raise ValueError(f"Invalid use_kernels value: {args.use_kernels}")
-        print(f"Using kernels: {use_kernels} [device capability: {device_capability}]")
+            # CPU-only mode: skip CUDA checks
+            use_kernels = False
+            device_capability = (0, 0)
+            print("Running CPU-only steps, skipping GPU detection")
 
         protocol_config = protocol_configs[protocol]
         print(f"Config overrides for protocol {protocol}: {protocol_config}")
@@ -929,7 +939,7 @@ class BinderDesignPipeline:
         )
 
         devices = (
-            args.devices if args.devices is not None else torch.cuda.device_count()
+            args.devices if args.devices is not None else (torch.cuda.device_count() if requires_gpu else 0)
         )
         print(f"Using {devices} devices")
 
