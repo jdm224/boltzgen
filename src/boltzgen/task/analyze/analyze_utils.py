@@ -106,6 +106,131 @@ def get_best_folding_sample(folded):
     return best_sample
 
 
+def compute_target_aligned_hl_rmsd(batch, best_sample_coords):
+    """
+    Compute RMSD of H+L chains (structure_group=2) after aligning 
+    on target chain (structure_group=1) backbone.
+    
+    This metric is useful for antibody design where:
+    - Target/antigen is structure_group=1
+    - H and L chains are structure_group=2
+    
+    Note: Design insertions have visibility=0, so we identify chains
+    by their structure_group membership, then include ALL residues in those
+    chains for the RMSD calculation.
+    
+    Args:
+        batch: Collated batch dict with design coords
+        best_sample_coords: numpy array of refolded coords
+    
+    Returns:
+        RMSD value (float)
+    """    
+    # Get coords
+    design_coords = batch["coords"].squeeze(0).squeeze(0)  # (L, 3)
+    refolded_coords = torch.from_numpy(best_sample_coords)  # (L, 3)
+    
+    # Get token-level features
+    structure_group = batch["structure_group"].squeeze(0)  # (num_tokens,)
+    asym_id = batch["asym_id"].squeeze(0)  # (num_tokens,)
+    
+    # Validate structure_group values - they should not all be 0
+    unique_groups = torch.unique(structure_group)
+    if len(unique_groups) == 1 and unique_groups[0].item() == 0:
+        raise ValueError(
+            "All structure_group values are 0. This indicates that visibility/structure_group "
+            "data was not properly propagated from the config. Ensure that:\n"
+            "  1. The config YAML has structure_groups with visibility values (1 for target, 2 for H+L)\n"
+            "  2. The design step was run with the updated writer.py that saves structure_group to NPZ\n"
+            "  3. The NPZ metadata files contain the structure_group field"
+        )
+    
+    # Identify which chains (asym_id values) belong to each structure_group
+    # A chain belongs to a group if ANY of its non-insertion tokens have that group
+    unique_asym_ids = torch.unique(asym_id)
+    
+    target_chain_ids = []
+    hl_chain_ids = []
+    for chain_id in unique_asym_ids:
+        chain_mask = (asym_id == chain_id)
+        chain_groups = structure_group[chain_mask]
+        if (chain_groups == 1).any():
+            target_chain_ids.append(chain_id.item())
+        if (chain_groups == 2).any():
+            hl_chain_ids.append(chain_id.item())
+    
+    # Validate that we found chains for both groups
+    if not target_chain_ids:
+        raise ValueError(
+            f"No chains found with structure_group=1 (target/antigen). "
+            f"Available structure_group values: {unique_groups.tolist()}. "
+            f"Check that your config has visibility: 1 for the target entity."
+        )
+    if not hl_chain_ids:
+        raise ValueError(
+            f"No chains found with structure_group=2 (H+L chains). "
+            f"Available structure_group values: {unique_groups.tolist()}. "
+            f"Check that your config has visibility: 2 for the antibody entities."
+        )
+    
+    # Create token-level masks for entire chains
+    target_chain_token_mask = torch.zeros_like(asym_id, dtype=torch.float32)
+    hl_chain_token_mask = torch.zeros_like(asym_id, dtype=torch.float32)
+    
+    for chain_id in target_chain_ids:
+        target_chain_token_mask = target_chain_token_mask + (asym_id == chain_id).float()
+    for chain_id in hl_chain_ids:
+        hl_chain_token_mask = hl_chain_token_mask + (asym_id == chain_id).float()
+    
+    # Convert to atom level
+    atom_to_token = batch["atom_to_token"].squeeze(0)
+    atom_target_chain_mask = (atom_to_token.float() @ target_chain_token_mask.unsqueeze(-1)).squeeze(-1)
+    atom_hl_chain_mask = (atom_to_token.float() @ hl_chain_token_mask.unsqueeze(-1)).squeeze(-1)
+    
+    atom_mask = batch["atom_resolved_mask"].squeeze(0).float()
+    backbone_mask = batch["backbone_mask"].squeeze(0).float()
+    
+    # Target chain backbone (for alignment)
+    target_bb_mask = (atom_target_chain_mask * atom_mask * backbone_mask).unsqueeze(0)
+    
+    # H+L chains backbone (for RMSD calculation) - includes all residues in these chains
+    hl_bb_mask = (atom_hl_chain_mask * atom_mask * backbone_mask).unsqueeze(0)
+    
+    if target_bb_mask.sum() == 0:
+        raise ValueError(
+            f"Target backbone mask is empty. target_chain_ids={target_chain_ids}, "
+            f"target_chain_token_mask.sum()={target_chain_token_mask.sum().item()}"
+        )
+    if hl_bb_mask.sum() == 0:
+        raise ValueError(
+            f"H+L backbone mask is empty. hl_chain_ids={hl_chain_ids}, "
+            f"hl_chain_token_mask.sum()={hl_chain_token_mask.sum().item()}"
+        )
+    
+    # Align on target backbone
+    aligned = weighted_rigid_align(
+        design_coords.unsqueeze(0),
+        refolded_coords.unsqueeze(0),
+        weights=target_bb_mask,
+        mask=target_bb_mask
+    )
+    
+    # Compute RMSD on H+L backbone
+    diff = ((refolded_coords.unsqueeze(0) - aligned) ** 2).sum(dim=-1)
+    rmsd = torch.sqrt((diff * hl_bb_mask).sum() / hl_bb_mask.sum().clamp_min(1e-7))
+    rmsd_value = rmsd.item()
+    
+    # Validate the computed RMSD
+    if rmsd_value != rmsd_value:  # NaN check (NaN != NaN is True)
+        raise ValueError(
+            f"Computed RMSD is NaN. This indicates a numerical issue. "
+            f"target_bb_mask.sum()={target_bb_mask.sum().item()}, "
+            f"hl_bb_mask.sum()={hl_bb_mask.sum().item()}"
+        )
+    
+    return rmsd_value
+
+
 def get_fold_metrics(
     feat,
     folded,
@@ -139,6 +264,13 @@ def get_fold_metrics(
     metrics["target_aligned<2.5"] = bool(metrics["target_aligned_rmsd_design"] <= 2.5)
     metrics["designability_rmsd_2"] = bool(metrics["rmsd_design"] <= 2.0)
     metrics["designability_rmsd_4"] = bool(metrics["rmsd_design"] <= 4.0)
+
+    # Custom: target-aligned RMSD for H+L chains using structure_group
+    # Aligns on target (structure_group=1) and computes RMSD on H+L (structure_group=2)
+    # Note: Named without bb_ prefix since get_fold_metrics() adds bb_ prefix
+    metrics["target_aligned_rmsd_hl"] = compute_target_aligned_hl_rmsd(
+        batch, best_sample["coords"]
+    )
 
     # Comput LDDTs
     if compute_lddts:

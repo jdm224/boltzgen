@@ -411,6 +411,11 @@ class DesignWriter(BasePredictionWriter):
                     binding_type=binding_type[sample["token_pad_mask"].bool()]
                     .cpu()
                     .numpy(),
+                    structure_group=sample["structure_group"][sample["token_pad_mask"].bool()]
+                    .cpu()
+                    .numpy()
+                    if "structure_group" in sample
+                    else None,
                 )
 
                 # Write trajectories

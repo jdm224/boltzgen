@@ -158,7 +158,7 @@ class Filter(Task):
         filter_bindingsite: bool = False,  # This filters out everything that does not have a residue within 4A of a binding site residue
         filter_target_aligned: bool = False,
         filter_biased: bool = True,  # This filters out sequences that are alanine rich, 30% alanine is threshold
-        refolding_rmsd_threshold: float = 2.5,
+        refolding_rmsd_threshold: float = 6.0,
         modality: str = "peptide",  # peptide, antibody
         peptide_type: str = "linear",  # linear, cyclic
         alpha: float = 0.1,  # 0 = quality-only, 1 = diversity-only
@@ -232,12 +232,7 @@ class Filter(Task):
         self.filters = [
             {"feature": "has_x", "lower_is_better": True, "threshold": 0},
             {
-                "feature": "filter_rmsd",
-                "lower_is_better": True,
-                "threshold": refolding_rmsd_threshold,
-            },
-            {
-                "feature": "filter_rmsd_design",
+                "feature": "bb_target_aligned_rmsd_hl",
                 "lower_is_better": True,
                 "threshold": refolding_rmsd_threshold,
             },
@@ -362,6 +357,12 @@ class Filter(Task):
         if self.from_inverse_folded:
             df["filter_rmsd"] = df["bb_rmsd"]
             df["filter_rmsd_design"] = df["bb_rmsd_design"]
+            # Custom: target-aligned H/L RMSD (aligns on target, computes RMSD on H+L chains)
+            if "bb_target_aligned_rmsd_hl" in df.columns:
+                df["filter_rmsd_hl"] = df["bb_target_aligned_rmsd_hl"]
+                print(f"Using custom target-aligned H/L RMSD for filtering (bb_target_aligned_rmsd_hl)")
+            else:
+                print("Warning: bb_target_aligned_rmsd_hl not found, filter_rmsd_hl not available")
         else:
             df["filter_rmsd"] = df["rmsd"]
             df["filter_rmsd_design"] = df["rmsd_design"]
@@ -1125,20 +1126,20 @@ class Filter(Task):
             body="""
                 Each scatter page contains two panels:
                 • Left – all designs (grey) with overlays of Top (red) and Diverse (blue).
-                • Right – same but limited to designs passing the RMSD filter.
+                • Right – same but limited to designs passing all filters.
                 """,
         )
         for x, y in extra_pairs:
             if x in self.df.columns and y in self.df.columns:
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8.5, 4.5))
                 self._scatter_plus(ax1, self.df, x, y, "All samples")
-                if self.df["pass_filter_rmsd_filter"].sum() > 0:
+                if self.df["pass_filters"].sum() > 0:
                     self._scatter_plus(
                         ax2,
-                        self.df[self.df["pass_filter_rmsd_filter"]],
+                        self.df[self.df["pass_filters"]],
                         x,
                         y,
-                        "(Designs passing RMSD threshold)",
+                        "(Designs passing all filters)",
                     )
                 show(fig)
 
@@ -1147,7 +1148,7 @@ class Filter(Task):
             body=(
                 "Distribution of each metric across all designs (grey) with overlays for Top-quality (red outline) "
                 "and Diversity-optimised (blue dashed) subsets. The right panel repeats the histogram but only for designs "
-                "that pass the RMSD threshold."
+                "that pass all filters."
             ),
         )
         for m in hist_metrics:
@@ -1157,14 +1158,14 @@ class Filter(Task):
             self._hist_plus(
                 ax1, self.df[m], self.df[: self.top_budget][m], self.df_div[m], m, ""
             )
-            if self.df["pass_filter_rmsd_filter"].sum() > 0:
+            if self.df["pass_filters"].sum() > 0:
                 self._hist_plus(
                     ax2,
-                    self.df[self.df["pass_filter_rmsd_filter"]][m],
+                    self.df[self.df["pass_filters"]][m],
                     self.df[: self.top_budget][m],
                     self.df_div[m],
                     m,
-                    " (Designs passing RMSD threshold)",
+                    " (Designs passing all filters)",
                 )
             show(fig)
 

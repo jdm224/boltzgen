@@ -317,8 +317,12 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
         if "binding_type" in metadata:
             binding_type = metadata["binding_type"]
 
+        structure_group = None
+        if "structure_group" in metadata:
+            structure_group = metadata["structure_group"]
+
         # Get features
-        feat = self.get_feat(generated_path, design_mask, ss_type, binding_type)
+        feat = self.get_feat(generated_path, design_mask, ss_type, binding_type, structure_group)
 
         # Get native features
         if self.return_native:
@@ -332,7 +336,7 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
 
         return feat
 
-    def get_feat(self, path, design_mask, ss_type=None, binding_type=None):
+    def get_feat(self, path, design_mask, ss_type=None, binding_type=None, structure_group=None):
         # Load design
         if self.extra_mol_dir is not None:
             mols = {
@@ -400,6 +404,10 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
         # For inverse folding, condition even on structure selected for design
         if self.inverse_fold:
             tokenized.tokens["structure_group"] = 1
+
+        # Apply structure_group from metadata if available (overrides inverse_fold default)
+        if structure_group is not None:
+            tokenized.tokens["structure_group"] = structure_group
 
         try:
             # Try to find molecules in the dataset moldir if provided
